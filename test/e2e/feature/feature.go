@@ -425,6 +425,10 @@ var (
 	StatefulUpgrade = framework.WithFeature(framework.ValidFeatures.Add("StatefulUpgrade"))
 
 	// Owner: sig-storage
+	// Tests marked with this feature exercise scheduling behavior that scores nodes based on CSI storage capacity.
+	StorageCapacityScoring = framework.WithFeature(framework.ValidFeatures.Add("StorageCapacityScoring"))
+
+	// Owner: sig-storage
 	// TODO: document the feature (when to use this feature for a test)
 	StorageProvider = framework.WithFeature(framework.ValidFeatures.Add("StorageProvider"))
 
@@ -476,7 +480,7 @@ var (
 	Volumes = framework.WithFeature(framework.ValidFeatures.Add("Volumes"))
 
 	// Owner: sig-windows
-	// TODO: document the feature (when to use this feature for a test)
+	// Indicates that tests labeled with this feature depend on Windows and thus may only be run on Windows nodes.
 	Windows = framework.WithFeature(framework.ValidFeatures.Add("Windows"))
 
 	// Owner: sig-windows

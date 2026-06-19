@@ -38,7 +38,7 @@ import (
 	"github.com/opencontainers/selinux/go-selinux"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
-	semconv "go.opentelemetry.io/otel/semconv/v1.40.0"
+	semconv "go.opentelemetry.io/otel/semconv/v1.41.0"
 	"go.opentelemetry.io/otel/trace"
 
 	"k8s.io/client-go/informers"
@@ -408,10 +408,20 @@ func PreInitRuntimeService(ctx context.Context, kubeCfg *kubeletconfiginternal.K
 	}
 	var err error
 	useStreaming := utilfeature.DefaultFeatureGate.Enabled(features.CRIListStreaming)
-	if kubeDeps.RemoteRuntimeService, err = remote.NewRemoteRuntimeService(ctx, kubeCfg.ContainerRuntimeEndpoint, kubeCfg.RuntimeRequestTimeout.Duration, kubeDeps.TracerProvider, useStreaming); err != nil {
+	if kubeDeps.RemoteRuntimeService, err = remote.NewRemoteRuntimeServiceBuilder().
+		WithEndpoint(kubeCfg.ContainerRuntimeEndpoint).
+		WithConnectionTimeout(kubeCfg.RuntimeRequestTimeout.Duration).
+		WithTracerProvider(kubeDeps.TracerProvider).
+		WithUseStreaming(useStreaming).
+		Build(ctx); err != nil {
 		return err
 	}
-	if kubeDeps.RemoteImageService, err = remote.NewRemoteImageService(ctx, remoteImageEndpoint, kubeCfg.RuntimeRequestTimeout.Duration, kubeDeps.TracerProvider, useStreaming); err != nil {
+	if kubeDeps.RemoteImageService, err = remote.NewRemoteImageServiceBuilder().
+		WithEndpoint(remoteImageEndpoint).
+		WithConnectionTimeout(kubeCfg.RuntimeRequestTimeout.Duration).
+		WithTracerProvider(kubeDeps.TracerProvider).
+		WithUseStreaming(useStreaming).
+		Build(ctx); err != nil {
 		return err
 	}
 
@@ -660,9 +670,9 @@ func NewMainKubelet(ctx context.Context,
 			configMapManager = configmap.NewWatchingConfigMapManager(klet.kubeClient, klet.resyncInterval)
 		case kubeletconfiginternal.TTLCacheChangeDetectionStrategy:
 			secretManager = secret.NewCachingSecretManager(
-				klet.kubeClient, manager.GetObjectTTLFromNodeFunc(klet.GetNode))
+				klet.kubeClient, manager.GetObjectTTLFromNodeFunc(ctx, klet.GetNode))
 			configMapManager = configmap.NewCachingConfigMapManager(
-				klet.kubeClient, manager.GetObjectTTLFromNodeFunc(klet.GetNode))
+				klet.kubeClient, manager.GetObjectTTLFromNodeFunc(ctx, klet.GetNode))
 		case kubeletconfiginternal.GetChangeDetectionStrategy:
 			secretManager = secret.NewSimpleSecretManager(klet.kubeClient)
 			configMapManager = configmap.NewSimpleConfigMapManager(klet.kubeClient)
@@ -674,7 +684,7 @@ func NewMainKubelet(ctx context.Context,
 		klet.configMapManager = configMapManager
 	}
 
-	machineInfo, err := klet.cadvisor.MachineInfo()
+	machineInfo, err := klet.cadvisor.MachineInfo(logger)
 	if err != nil {
 		return nil, err
 	}
@@ -709,6 +719,7 @@ func NewMainKubelet(ctx context.Context,
 		klet.podManager.GetPodByUID,
 		klet.sourcesReady,
 		kubeDeps.Recorder,
+		logger,
 	)
 
 	klet.resourceAnalyzer = serverstats.NewResourceAnalyzer(ctx, klet, kubeCfg.VolumeStatsAggPeriod.Duration, kubeDeps.Recorder)
@@ -1409,22 +1420,23 @@ type Kubelet struct {
 	// it's set to true by fastStatusUpdateOnce when it exits.
 	containerRuntimeReadyExpected bool
 
-	// nodeStatusUpdateFrequency specifies how often kubelet computes node status. If node lease
-	// feature is not enabled, it is also the frequency that kubelet posts node status to master.
-	// In that case, be cautious when changing the constant, it must work with nodeMonitorGracePeriod
-	// in nodecontroller. There are several constraints:
-	// 1. nodeMonitorGracePeriod must be N times more than nodeStatusUpdateFrequency, where
-	//    N means number of retries allowed for kubelet to post node status. It is pointless
-	//    to make nodeMonitorGracePeriod be less than nodeStatusUpdateFrequency, since there
-	//    will only be fresh values from Kubelet at an interval of nodeStatusUpdateFrequency.
-	//    The constant must be less than podEvictionTimeout.
-	// 2. nodeStatusUpdateFrequency needs to be large enough for kubelet to generate node
-	//    status. Kubelet may fail to update node status reliably if the value is too small,
-	//    as it takes time to gather all necessary node information.
+	// nodeStatusUpdateFrequency specifies how often kubelet computes node status
+	// and checks whether an update to the API server is necessary. On each tick,
+	// kubelet recomputes the node status and posts it to the API server if the
+	// status has changed or if nodeStatusReportFrequency has elapsed since the
+	// last report.
+	// Note: node liveness is primarily signaled to the node controller via
+	// NodeLease renewals. nodeStatusUpdateFrequency controls how quickly node
+	// status changes (e.g. conditions) are detected and reported.
+	// nodeStatusUpdateFrequency needs to be large enough for kubelet to generate
+	// node status. Kubelet may fail to update node status reliably if the value
+	// is too small, as it takes time to gather all necessary node information.
 	nodeStatusUpdateFrequency time.Duration
 
 	// nodeStatusReportFrequency is the frequency that kubelet posts node
-	// status to master. It is only used when node lease feature is enabled.
+	// status to the API server if node status does not change. Kubelet will
+	// ignore this frequency and post node status immediately if any change
+	// is detected.
 	nodeStatusReportFrequency time.Duration
 
 	// delayAfterNodeStatusChange is the one-time random duration that we add to the next node status report interval
@@ -2185,7 +2197,7 @@ func (kl *Kubelet) SyncPod(ctx context.Context, updateType kubetypes.SyncPodType
 					return false, nil, fmt.Errorf("failed to ensure that the pod: %v cgroups exist and are correctly applied: %v", pod.UID, err)
 				}
 
-				if err = kl.containerRuntime.UpdateActuatedPodLevelResources(pod); err != nil {
+				if err = kl.containerRuntime.UpdateActuatedPodLevelResources(logger, pod); err != nil {
 					return false, nil, fmt.Errorf("failed to update the state of pod-level resources for the pod %v : %w", pod.UID, err)
 				}
 			}
@@ -2879,7 +2891,7 @@ func (kl *Kubelet) HandlePodAdditions(ctx context.Context, pods []*v1.Pod) {
 			// Check if we can admit the pod; if not, reject it.
 			// We failed pods that we rejected, so activePods include all admitted
 			// pods that are alive.
-			if ok, reason, message := kl.allocationManager.AddPod(kl.GetActivePods(), pod); !ok {
+			if ok, reason, message := kl.allocationManager.AddPod(ctx, kl.GetActivePods(), pod); !ok {
 				kl.rejectPod(ctx, pod, reason, message)
 				// We avoid recording the metric in canAdmitPod because it's called
 				// repeatedly during a resize, which would inflate the metric.
@@ -2909,7 +2921,7 @@ func (kl *Kubelet) HandlePodAdditions(ctx context.Context, pods []*v1.Pod) {
 	if utilfeature.DefaultFeatureGate.Enabled(features.InPlacePodVerticalScaling) {
 		kl.statusManager.BackfillPodResizeConditions(pods)
 		for _, uid := range pendingResizes {
-			kl.allocationManager.PushPendingResize(uid)
+			kl.allocationManager.PushPendingResize(logger, uid)
 		}
 		if len(pendingResizes) > 0 {
 			kl.allocationManager.RetryPendingResizes(ctx, allocation.TriggerReasonPodsAdded)
@@ -2938,7 +2950,7 @@ func (kl *Kubelet) HandlePodUpdates(ctx context.Context, pods []*v1.Pod) {
 			if recordResizeOperations(oldPod, pod) {
 				_, updatedFromAllocation := kl.allocationManager.UpdatePodFromAllocation(pod)
 				if updatedFromAllocation {
-					kl.allocationManager.PushPendingResize(pod.UID)
+					kl.allocationManager.PushPendingResize(logger, pod.UID)
 					// TODO(natasha41575): If the resize is immediately actuated, it will trigger a pod sync
 					// and we will end up calling UpdatePod twice. Figure out if there is a way to avoid this.
 					kl.allocationManager.RetryPendingResizes(ctx, allocation.TriggerReasonPodUpdated)
@@ -3072,7 +3084,7 @@ func (kl *Kubelet) HandlePodRemoves(ctx context.Context, pods []*v1.Pod) {
 	for _, pod := range pods {
 		kl.podCertificateManager.ForgetPod(ctx, pod)
 		kl.podManager.RemovePod(pod)
-		kl.allocationManager.RemovePod(pod.UID)
+		kl.allocationManager.RemovePod(logger, pod.UID)
 
 		pod, mirrorPod, wasMirror := kl.podManager.GetPodAndMirrorPod(pod)
 		if wasMirror {

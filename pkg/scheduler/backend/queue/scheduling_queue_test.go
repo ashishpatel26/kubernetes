@@ -1021,7 +1021,6 @@ func Test_InFlightPods(t *testing.T) {
 			t.Run(fmt.Sprintf("%s (genericWorkloadEnabled: %v)", test.name, genericWorkloadEnabled), func(t *testing.T) {
 				featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
 					features.GenericWorkload: genericWorkloadEnabled,
-					features.GangScheduling:  true,
 				})
 				logger, ctx := ktesting.NewTestContext(t)
 				ctx, cancel := context.WithCancel(ctx)
@@ -1392,7 +1391,6 @@ func TestPriorityQueue_Pop(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
 				features.GenericWorkload:          tt.genericWorkloadEnabled,
-				features.GangScheduling:           tt.genericWorkloadEnabled,
 				features.SchedulerPopFromBackoffQ: tt.popFromBackoffQEnabled,
 			})
 
@@ -3580,6 +3578,137 @@ func TestFlushUnschedulableEntitiesLeftoverSetsFlag(t *testing.T) {
 	}
 	if internalPInfo.(*framework.QueuedPodInfo).WasFlushedFromUnschedulable {
 		t.Errorf("Expected WasFlushedFromUnschedulable to be cleared (false) after returning to queue, but got true")
+	}
+}
+
+func TestFlushUnschedulablePodsLeftoverSetsFlag_GatedPod(t *testing.T) {
+	tests := []struct {
+		name                            string
+		gatedBeforeFlush                bool
+		gatedAfterFlush                 bool
+		backingOff                      bool
+		wantWasFlushedFromUnschedulable bool
+		wantQ                           string
+	}{
+		{
+			name:                            "flag is set when pod is not gated",
+			wantWasFlushedFromUnschedulable: true,
+			wantQ:                           activeQ,
+		},
+		{
+			name:                            "flag is set when pod is no longer gated",
+			gatedBeforeFlush:                true,
+			wantWasFlushedFromUnschedulable: true,
+			wantQ:                           activeQ,
+		},
+		{
+			name:                            "flag is unset when pod is newly gated",
+			gatedAfterFlush:                 true,
+			wantWasFlushedFromUnschedulable: false,
+			wantQ:                           unschedulableQ,
+		},
+		{
+			name:                            "flag is unset when pod is still gated",
+			gatedBeforeFlush:                true,
+			gatedAfterFlush:                 true,
+			wantWasFlushedFromUnschedulable: false,
+			wantQ:                           unschedulableQ,
+		},
+		{
+			name:                            "flag is set when pod is not gated and backoff is not complete",
+			backingOff:                      true,
+			wantWasFlushedFromUnschedulable: true,
+			wantQ:                           backoffQ,
+		},
+		{
+			name:                            "flag is set when pod is no longer gated and backoff is not complete",
+			gatedBeforeFlush:                true,
+			backingOff:                      true,
+			wantWasFlushedFromUnschedulable: true,
+			wantQ:                           backoffQ,
+		},
+		{
+			name:                            "flag is unset when pod is newly gated and backoff is not complete",
+			gatedAfterFlush:                 true,
+			backingOff:                      true,
+			wantWasFlushedFromUnschedulable: false,
+			wantQ:                           unschedulableQ,
+		},
+		{
+			name:                            "flag is unset when pod is still gated and backoff is not complete",
+			gatedBeforeFlush:                true,
+			gatedAfterFlush:                 true,
+			backingOff:                      true,
+			wantWasFlushedFromUnschedulable: false,
+			wantQ:                           unschedulableQ,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			const allowedLabel = "allow"
+			const preEnqueuePluginName = "preEnqueuePlugin"
+
+			var backoffDuration time.Duration
+			if tt.backingOff {
+				backoffDuration = DefaultPodMaxInUnschedulablePodsDuration + time.Minute
+			}
+
+			c := testingclock.NewFakeClock(time.Now())
+			m := makeEmptyQueueingHintMapPerProfile()
+			preEnqM := map[string]map[string]fwk.PreEnqueuePlugin{
+				"": {
+					preEnqueuePluginName: &preEnqueuePlugin{allowlists: []string{allowedLabel}},
+				},
+			}
+			logger, ctx := ktesting.NewTestContext(t)
+			ctx, cancel := context.WithCancel(ctx)
+			defer cancel()
+			q := NewTestQueue(ctx, newDefaultQueueSort(), WithClock(c), WithQueueingHintMapPerProfile(m), WithPreEnqueuePluginMap(preEnqM),
+				WithPodInitialBackoffDuration(backoffDuration), WithPodMaxBackoffDuration(backoffDuration))
+
+			pod := st.MakePod().Name("pod1").Namespace("ns1").UID("1").Label(allowedLabel, "").Obj()
+			podInfo := &framework.QueuedPodInfo{PodInfo: mustNewPodInfo(pod), QueueingParams: framework.QueueingParams{UnschedulablePlugins: sets.New("foo")}}
+			if tt.gatedBeforeFlush {
+				podInfo = setQueuedPodInfoGated(podInfo, preEnqueuePluginName, []fwk.ClusterEvent{})
+			}
+
+			q.Add(ctx, podInfo.Pod)
+			_, err := q.Pop(logger)
+			if err != nil {
+				t.Fatalf("Failed to pop from active queue: %v", err)
+			}
+
+			if tt.gatedAfterFlush {
+				delete(pod.Labels, allowedLabel)
+			}
+
+			err = q.AddUnschedulablePodIfNotPresent(logger, podInfo, q.SchedulingCycle())
+			if err != nil {
+				t.Fatalf("Failed to add pod to unschedulable: %v", err)
+			}
+
+			// Advance time past the flush duration and flush
+			c.Step(DefaultPodMaxInUnschedulablePodsDuration + time.Second)
+			q.flushUnschedulableEntitiesLeftover(logger)
+
+			queueSizes := map[string]int{
+				unschedulableQ: len(q.UnschedulablePods()),
+				backoffQ:       len(q.PodsInBackoffQ()),
+				activeQ:        len(q.PodsInActiveQ()),
+			}
+
+			if queueSizes[tt.wantQ] == 0 {
+				t.Errorf("Pod not found in %s", tt.wantQ)
+			}
+			actualPod, ok := q.GetPod(podInfo.Pod.Name, podInfo.Pod.Namespace, nil)
+			if !ok {
+				t.Fatalf("Pod not found in scheduling queue")
+			}
+			if actualPod.WasFlushedFromUnschedulable != tt.wantWasFlushedFromUnschedulable {
+				t.Errorf("Unexpected WasFlushedFromUnschedulable value: %v", actualPod.WasFlushedFromUnschedulable)
+			}
+		})
 	}
 }
 
@@ -6001,7 +6130,6 @@ func TestAddPodGroupMember(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
 				features.GenericWorkload: true,
-				features.GangScheduling:  true,
 			})
 
 			_, ctx := ktesting.NewTestContext(t)
@@ -6202,7 +6330,6 @@ func TestDeletePodGroupMember(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
 				features.GenericWorkload: true,
-				features.GangScheduling:  true,
 			})
 
 			logger, ctx := ktesting.NewTestContext(t)
@@ -6386,7 +6513,6 @@ func TestUpdatePodGroupMember(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
 				features.GenericWorkload: true,
-				features.GangScheduling:  true,
 			})
 
 			_, ctx := ktesting.NewTestContext(t)
@@ -6551,7 +6677,6 @@ func TestActivatePodGroupMember(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
 				features.GenericWorkload: true,
-				features.GangScheduling:  true,
 			})
 
 			logger, ctx := ktesting.NewTestContext(t)
@@ -6714,7 +6839,6 @@ func TestMoveAllToActiveOrBackoffQueuePodGroupMember(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
 				features.GenericWorkload: true,
-				features.GangScheduling:  true,
 			})
 
 			logger, ctx := ktesting.NewTestContext(t)
@@ -6858,7 +6982,6 @@ func TestFlushBackoffQCompletedPodGroupMember(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
 				features.GenericWorkload: true,
-				features.GangScheduling:  true,
 			})
 
 			logger, ctx := ktesting.NewTestContext(t)
@@ -6961,7 +7084,6 @@ func TestFlushUnschedulableEntitiesLeftoverPodGroupMember(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
 				features.GenericWorkload: true,
-				features.GangScheduling:  true,
 			})
 
 			logger, ctx := ktesting.NewTestContext(t)
@@ -7135,7 +7257,6 @@ func TestAddUnschedulablePodIfNotPresentPodGroupMember(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
 				features.GenericWorkload: true,
-				features.GangScheduling:  true,
 			})
 
 			logger, ctx := ktesting.NewTestContext(t)

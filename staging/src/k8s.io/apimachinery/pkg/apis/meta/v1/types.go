@@ -1613,6 +1613,9 @@ type PartialObjectMetadataList struct {
 //	    // +patchStrategy=merge
 //	    // +listType=map
 //	    // +listMapKey=type
+//	    // +k8s:alpha(since: "1.37")=+k8s:optional
+//	    // +k8s:alpha(since: "1.37")=+k8s:listType=map
+//	    // +k8s:alpha(since: "1.37")=+k8s:listMapKey=type
 //	    Conditions []metav1.Condition `json:"conditions,omitempty" patchStrategy:"merge" patchMergeKey:"type" protobuf:"bytes,1,rep,name=conditions"`
 //
 //	    // other fields
@@ -1627,6 +1630,7 @@ type Condition struct {
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:Pattern=`^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$`
 	// +kubebuilder:validation:MaxLength=316
+	// +k8s:alpha(since: "1.37")=+k8s:required
 	Type string `json:"type" protobuf:"bytes,1,opt,name=type"`
 	// status of the condition, one of True, False, Unknown.
 	// +required
@@ -1638,6 +1642,8 @@ type Condition struct {
 	// with respect to the current state of the instance.
 	// +optional
 	// +kubebuilder:validation:Minimum=0
+	// +k8s:alpha(since: "1.37")=+k8s:optional
+	// +k8s:alpha(since: "1.37")=+k8s:minimum=0
 	ObservedGeneration int64 `json:"observedGeneration,omitempty" protobuf:"varint,3,opt,name=observedGeneration"`
 	// lastTransitionTime is the last time the condition transitioned from one status to another.
 	// This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.

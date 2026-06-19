@@ -4769,8 +4769,10 @@ func Test_generateAPIPodStatus(t *testing.T) {
 				},
 			},
 			expectedPodReadyToStartContainersCondition: v1.PodCondition{
-				Type:   v1.PodReadyToStartContainers,
-				Status: v1.ConditionFalse,
+				Type:    v1.PodReadyToStartContainers,
+				Status:  v1.ConditionFalse,
+				Reason:  kubetypes.PodSandboxNotReadyReason,
+				Message: kubetypes.PodSandboxNotReadyMsgNoPodSandbox,
 			},
 		},
 		{
@@ -4815,8 +4817,10 @@ func Test_generateAPIPodStatus(t *testing.T) {
 				Message: "test",
 			},
 			expectedPodReadyToStartContainersCondition: v1.PodCondition{
-				Type:   v1.PodReadyToStartContainers,
-				Status: v1.ConditionFalse,
+				Type:    v1.PodReadyToStartContainers,
+				Status:  v1.ConditionFalse,
+				Reason:  kubetypes.PodSandboxNotReadyReason,
+				Message: kubetypes.PodSandboxNotReadyMsgNoPodSandbox,
 			},
 		},
 		{
@@ -4868,8 +4872,10 @@ func Test_generateAPIPodStatus(t *testing.T) {
 				Message: "test",
 			},
 			expectedPodReadyToStartContainersCondition: v1.PodCondition{
-				Type:   v1.PodReadyToStartContainers,
-				Status: v1.ConditionFalse,
+				Type:    v1.PodReadyToStartContainers,
+				Status:  v1.ConditionFalse,
+				Reason:  kubetypes.PodSandboxNotReadyReason,
+				Message: kubetypes.PodSandboxNotReadyMsgNoPodSandbox,
 			},
 		},
 		{
@@ -5747,8 +5753,8 @@ func Test_generateAPIPodStatus(t *testing.T) {
 }
 
 func Test_generateAPIPodStatusForInPlaceVPAEnabled(t *testing.T) {
-	if goruntime.GOOS == "windows" {
-		t.Skip("InPlacePodVerticalScaling is not currently supported for Windows")
+	if goruntime.GOOS != "linux" {
+		t.Skip("InPlacePodVerticalScaling cgroup resource reporting is only supported on Linux")
 	}
 	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.InPlacePodVerticalScaling, true)
 	testContainerName := "ctr0"
@@ -6569,9 +6575,9 @@ func TestConvertToAPIContainerStatusesDataRace(t *testing.T) {
 }
 
 func TestConvertToAPIContainerStatusesForResources(t *testing.T) {
-	tCtx := ktesting.Init(t)
-	if goruntime.GOOS == "windows" {
-		t.Skip("InPlacePodVerticalScaling is not currently supported for Windows")
+	logger, tCtx := ktesting.NewTestContext(t)
+	if goruntime.GOOS != "linux" {
+		t.Skip("InPlacePodVerticalScaling cgroup resource reporting is only supported on Linux")
 	}
 	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.InPlacePodVerticalScaling, true)
 
@@ -7017,7 +7023,7 @@ func TestConvertToAPIContainerStatusesForResources(t *testing.T) {
 			} else {
 				tPod.Spec.Containers[0].Resources = tc.Resources
 			}
-			err := kubelet.allocationManager.SetAllocatedResources(tPod)
+			err := kubelet.allocationManager.SetAllocatedResources(logger, tPod)
 			require.NoError(t, err)
 			resources := tc.ActualResources
 			if resources == nil {

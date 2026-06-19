@@ -162,6 +162,15 @@ func init() {
 			"status.devices[*]": {
 				{ErrorType: "FieldValueDuplicate"},
 			},
+			"status.devices[*].conditions[*]": {
+				{ErrorType: "FieldValueDuplicate"},
+			},
+			"status.devices[*].conditions[*].observedGeneration": {
+				{ErrorType: "FieldValueInvalid", Origin: "minimum"},
+			},
+			"status.devices[*].conditions[*].type": {
+				{ErrorType: "FieldValueRequired"},
+			},
 			"status.devices[*].networkData.hardwareAddress": {
 				{ErrorType: "FieldValueTooLong", Origin: "maxBytes"},
 			},

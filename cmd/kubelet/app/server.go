@@ -50,7 +50,7 @@ import (
 	cadvisorapi "github.com/google/cadvisor/info/v1"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 	otelsdkresource "go.opentelemetry.io/otel/sdk/resource"
-	semconv "go.opentelemetry.io/otel/semconv/v1.40.0"
+	semconv "go.opentelemetry.io/otel/semconv/v1.41.0"
 	oteltrace "go.opentelemetry.io/otel/trace"
 	noopoteltrace "go.opentelemetry.io/otel/trace/noop"
 
@@ -726,6 +726,12 @@ func run(ctx context.Context, s *options.KubeletServer, kubeDeps *kubelet.Depend
 		// make a separate client for events
 		eventClientConfig := *clientConfig
 		eventClientConfig.QPS = float32(s.EventRecordQPS)
+
+		// If the value of EventRecordQPS is 0, there is no limit enforced
+		if int(eventClientConfig.QPS) == 0 {
+			eventClientConfig.QPS = float32(-1)
+		}
+
 		eventClientConfig.Burst = int(s.EventBurst)
 		kubeDeps.EventClient, err = v1core.NewForConfig(&eventClientConfig)
 		if err != nil {
@@ -809,7 +815,7 @@ func run(ctx context.Context, s *options.KubeletServer, kubeDeps *kubelet.Depend
 			s.CgroupRoot = "/"
 		}
 
-		machineInfo, err := kubeDeps.CAdvisorInterface.MachineInfo()
+		machineInfo, err := kubeDeps.CAdvisorInterface.MachineInfo(logger)
 		if err != nil {
 			return err
 		}
@@ -1368,6 +1374,9 @@ func parseResourceList(m map[string]string) (v1.ResourceList, error) {
 			}
 			if q.Sign() == -1 {
 				return nil, fmt.Errorf("resource quantity for %q cannot be negative: %v", k, v)
+			}
+			if v1.ResourceName(k) == v1.ResourceCPU {
+				q.SetMilli((q.ScaledValue(resource.Micro) + 500) / 1000)
 			}
 			rl[v1.ResourceName(k)] = q
 		default:

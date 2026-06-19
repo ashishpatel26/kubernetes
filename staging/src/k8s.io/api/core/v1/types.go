@@ -4094,6 +4094,8 @@ type Toleration struct {
 	// Key is the taint key that the toleration applies to. Empty means match all taint keys.
 	// If the key is empty, operator must be Exists; this combination means to match all values and all keys.
 	// +optional
+	// +k8s:alpha(since: "1.37")=+k8s:optional
+	// +k8s:alpha(since: "1.37")=+k8s:format=k8s-label-key
 	Key string `json:"key,omitempty" protobuf:"bytes,1,opt,name=key"`
 	// Operator represents a key's relationship to the value.
 	// Valid operators are Exists, Equal, Lt, and Gt. Defaults to Equal.
@@ -4224,7 +4226,6 @@ type PodSpec struct {
 	ServiceAccountName string `json:"serviceAccountName,omitempty" protobuf:"bytes,8,opt,name=serviceAccountName"`
 	// DeprecatedServiceAccount is a deprecated alias for ServiceAccountName.
 	// Deprecated: Use serviceAccountName instead.
-	// +k8s:conversion-gen=false
 	// +optional
 	DeprecatedServiceAccount string `json:"serviceAccount,omitempty" protobuf:"bytes,9,opt,name=serviceAccount"`
 	// AutomountServiceAccountToken indicates whether a service account token should be automatically mounted.
@@ -4243,17 +4244,14 @@ type PodSpec struct {
 	// When `hostNetwork` is true, specified `hostPort` fields in port definitions must match `containerPort`,
 	// and unspecified `hostPort` fields in port definitions are defaulted to match `containerPort`.
 	// Default to false.
-	// +k8s:conversion-gen=false
 	// +optional
 	HostNetwork bool `json:"hostNetwork,omitempty" protobuf:"varint,11,opt,name=hostNetwork"`
 	// Use the host's pid namespace.
 	// Optional: Default to false.
-	// +k8s:conversion-gen=false
 	// +optional
 	HostPID bool `json:"hostPID,omitempty" protobuf:"varint,12,opt,name=hostPID"`
 	// Use the host's ipc namespace.
 	// Optional: Default to false.
-	// +k8s:conversion-gen=false
 	// +optional
 	HostIPC bool `json:"hostIPC,omitempty" protobuf:"varint,13,opt,name=hostIPC"`
 	// Share a single process namespace between all of the containers in a pod.
@@ -4261,7 +4259,6 @@ type PodSpec struct {
 	// in the same pod, and the first process in each container will not be assigned PID 1.
 	// HostPID and ShareProcessNamespace cannot both be set.
 	// Optional: Default to false.
-	// +k8s:conversion-gen=false
 	// +optional
 	ShareProcessNamespace *bool `json:"shareProcessNamespace,omitempty" protobuf:"varint,27,opt,name=shareProcessNamespace"`
 	// SecurityContext holds pod-level security attributes and common container settings.
@@ -4295,6 +4292,7 @@ type PodSpec struct {
 	// If specified, the pod's tolerations.
 	// +optional
 	// +listType=atomic
+	// +k8s:alpha(since: "1.37")=+k8s:optional
 	Tolerations []Toleration `json:"tolerations,omitempty" protobuf:"bytes,22,opt,name=tolerations"`
 	// HostAliases is an optional list of hosts and IPs that will be injected into the pod's hosts
 	// file if specified.
@@ -4345,6 +4343,8 @@ type PodSpec struct {
 	EnableServiceLinks *bool `json:"enableServiceLinks,omitempty" protobuf:"varint,30,opt,name=enableServiceLinks"`
 	// PreemptionPolicy is the Policy for preempting pods with lower priority.
 	// One of Never, PreemptLowerPriority.
+	// When Priority Admission Controller is enabled, it prevents users from setting
+	// this field. The admission controller populates this field from PriorityClassName.
 	// Defaults to PreemptLowerPriority if unset.
 	// +optional
 	PreemptionPolicy *PreemptionPolicy `json:"preemptionPolicy,omitempty" protobuf:"bytes,31,opt,name=preemptionPolicy"`
@@ -4417,7 +4417,6 @@ type PodSpec struct {
 	// When set to false, a new userns is created for the pod. Setting false is useful for
 	// mitigating container breakout vulnerabilities even allowing users to run their
 	// containers as root without actually having root privileges on the host.
-	// +k8s:conversion-gen=false
 	// +optional
 	HostUsers *bool `json:"hostUsers,omitempty" protobuf:"bytes,37,opt,name=hostUsers"`
 
@@ -5492,6 +5491,8 @@ type PodStatus struct {
 // by clients and scheduled onto hosts.
 // +k8s:supportsSubresource="/status"
 // +k8s:supportsSubresource="/ephemeralcontainers"
+// +k8s:supportsSubresource="/resize"
+// +k8s:supportsSubresource="/eviction"
 type Pod struct {
 	metav1.TypeMeta `json:""`
 	// Standard object's metadata.
@@ -5616,6 +5617,7 @@ type ReplicationControllerSpec struct {
 	// The only allowed template.spec.restartPolicy value is "Always".
 	// More info: https://kubernetes.io/docs/concepts/workloads/controllers/replicationcontroller#pod-template
 	// +optional
+	// +k8s:alpha(since: "1.37")=+k8s:optional
 	Template *PodTemplateSpec `json:"template,omitempty" protobuf:"bytes,3,opt,name=template"`
 }
 
@@ -5877,6 +5879,7 @@ type ServiceStatus struct {
 	// +patchStrategy=merge
 	// +listType=map
 	// +listMapKey=type
+	// +k8s:alpha(since: "1.37")=+k8s:eachVal=+k8s:opaqueType
 	Conditions []metav1.Condition `json:"conditions,omitempty" patchStrategy:"merge" patchMergeKey:"type" protobuf:"bytes,2,rep,name=conditions"`
 }
 
@@ -7956,6 +7959,8 @@ type Secret struct {
 	// Used to facilitate programmatic handling of secret data.
 	// More info: https://kubernetes.io/docs/concepts/configuration/secret/#secret-types
 	// +optional
+	// +k8s:optional
+	// +k8s:alpha(since: "1.37")=+k8s:immutable
 	Type SecretType `json:"type,omitempty" protobuf:"bytes,3,opt,name=type,casttype=SecretType"`
 }
 

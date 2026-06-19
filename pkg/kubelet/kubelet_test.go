@@ -34,7 +34,6 @@ import (
 
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
-	oteltrace "go.opentelemetry.io/otel/trace"
 	noopoteltrace "go.opentelemetry.io/otel/trace/noop"
 
 	"k8s.io/component-base/metrics/legacyregistry"
@@ -65,7 +64,6 @@ import (
 	"k8s.io/component-base/metrics/testutil"
 	ndf "k8s.io/component-helpers/nodedeclaredfeatures"
 	ndftesting "k8s.io/component-helpers/nodedeclaredfeatures/testing"
-	internalapi "k8s.io/cri-api/pkg/apis"
 	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
 	remote "k8s.io/cri-client/pkg"
 	fakeremote "k8s.io/cri-client/pkg/fake"
@@ -299,7 +297,7 @@ func newTestKubeletWithImageList(
 	kubelet.daemonEndpoints = &v1.NodeDaemonEndpoints{}
 
 	kubelet.cadvisor = &cadvisortest.Fake{}
-	machineInfo, _ := kubelet.cadvisor.MachineInfo()
+	machineInfo, _ := kubelet.cadvisor.MachineInfo(logger)
 	kubelet.setCachedMachineInfo(machineInfo)
 	kubelet.tracer = noopoteltrace.NewTracerProvider().Tracer("")
 
@@ -341,6 +339,7 @@ func newTestKubeletWithImageList(
 	}
 
 	kubelet.allocationManager = allocation.NewInMemoryManager(
+		logger,
 		kubelet.statusManager,
 		func(ctx context.Context, pod *v1.Pod) { kubelet.HandlePodSyncs(ctx, []*v1.Pod{pod}) },
 		kubelet.GetActivePods,
@@ -2726,7 +2725,7 @@ type testPodAdmitHandler struct {
 }
 
 // Admit rejects all pods in the podsToReject list with a matching UID.
-func (a *testPodAdmitHandler) Admit(attrs *lifecycle.PodAdmitAttributes) lifecycle.PodAdmitResult {
+func (a *testPodAdmitHandler) Admit(_ context.Context, attrs *lifecycle.PodAdmitAttributes) lifecycle.PodAdmitResult {
 	for _, podToReject := range a.podsToReject {
 		if podToReject.UID == attrs.Pod.UID {
 			return lifecycle.PodAdmitResult{Admit: false, Reason: "Rejected", Message: "Pod is rejected"}
@@ -2782,6 +2781,8 @@ func TestHandlePodAdditionsInvokesPodAdmitHandlers(t *testing.T) {
 }
 
 func TestPodResourceAllocationReset(t *testing.T) {
+	logger, tCtx := ktesting.NewTestContext(t)
+
 	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.InPlacePodVerticalScaling, true)
 	testKubelet := newTestKubelet(t, false)
 	defer testKubelet.Cleanup()
@@ -2977,10 +2978,9 @@ func TestPodResourceAllocationReset(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			tCtx := ktesting.Init(t)
 			if tc.existingPodAllocation != nil {
 				// when kubelet restarts, AllocatedResources has already existed before adding pod
-				err := kubelet.allocationManager.SetAllocatedResources(tc.existingPodAllocation)
+				err := kubelet.allocationManager.SetAllocatedResources(logger, tc.existingPodAllocation)
 				if err != nil {
 					t.Fatalf("failed to set pod allocation: %v", err)
 				}
@@ -3293,14 +3293,8 @@ func createAndStartFakeRemoteRuntime(t *testing.T) (*fakeremote.RemoteRuntime, s
 	return fakeRuntime, endpoint
 }
 
-func createRemoteRuntimeService(ctx context.Context, endpoint string, t *testing.T, tp oteltrace.TracerProvider) internalapi.RuntimeService {
-	runtimeService, err := remote.NewRemoteRuntimeService(ctx, endpoint, 15*time.Second, tp, false)
-	require.NoError(t, err)
-	return runtimeService
-}
-
 func TestNewMainKubeletStandAlone(t *testing.T) {
-	tCtx := ktesting.Init(t)
+	logger, tCtx := ktesting.NewTestContext(t)
 	tempDir, err := os.MkdirTemp("", "logs")
 	require.NoError(t, err)
 	containerLogsDir := ContainerLogsDir
@@ -3313,9 +3307,7 @@ func TestNewMainKubeletStandAlone(t *testing.T) {
 	// This is needed on Windows because a concurrent os.ReadDir in a GC goroutine
 	// can keep a handle to this directory in use and cause os.RemoveAll to fail.
 	t.Cleanup(func() {
-		ContainerLogsDir = containerLogsDir
-		err := os.RemoveAll(tempDir)
-		require.NoError(t, err)
+		cleanUpTempDir(t, tempDir, containerLogsDir)
 	})
 
 	ca, cert, key, err := generateCAAndCertKeyWithOptions(
@@ -3352,7 +3344,7 @@ func TestNewMainKubeletStandAlone(t *testing.T) {
 	var prober volume.DynamicPluginProber
 	tp := noopoteltrace.NewTracerProvider()
 	cadvisor := cadvisortest.NewMockInterface(t)
-	cadvisor.EXPECT().MachineInfo().Return(&cadvisorapi.MachineInfo{}, nil).Maybe()
+	cadvisor.EXPECT().MachineInfo(logger).Return(&cadvisorapi.MachineInfo{}, nil).Maybe()
 	cadvisor.EXPECT().ImagesFsInfo(tCtx).Return(cadvisorapiv2.FsInfo{
 		Usage:     400,
 		Capacity:  1000,
@@ -3369,7 +3361,11 @@ func TestNewMainKubeletStandAlone(t *testing.T) {
 		fakeRuntime.Stop()
 	}()
 	fakeRecorder := &record.FakeRecorder{}
-	rtSvc := createRemoteRuntimeService(tCtx, endpoint, t, noopoteltrace.NewTracerProvider())
+	rtSvc, err := remote.NewRemoteRuntimeServiceBuilder().
+		WithEndpoint(endpoint).
+		WithConnectionTimeout(15 * time.Second).
+		Build(tCtx)
+	require.NoError(t, err)
 	kubeDep := &Dependencies{
 		Auth:                 nil,
 		CAdvisorInterface:    cadvisor,
@@ -3461,7 +3457,7 @@ func TestNewMainKubeletStandAlone(t *testing.T) {
 }
 
 func TestNewMainKubeletWithCertAndCAReloadingEnabled(t *testing.T) {
-	tCtx := ktesting.Init(t)
+	logger, tCtx := ktesting.NewTestContext(t)
 	tempDir, err := os.MkdirTemp("", "logs")
 	require.NoError(t, err)
 	containerLogsDir := ContainerLogsDir
@@ -3474,9 +3470,7 @@ func TestNewMainKubeletWithCertAndCAReloadingEnabled(t *testing.T) {
 	// This is needed on Windows because a concurrent os.ReadDir in a GC goroutine
 	// can keep a handle to this directory in use and cause os.RemoveAll to fail.
 	t.Cleanup(func() {
-		ContainerLogsDir = containerLogsDir
-		err := os.RemoveAll(tempDir)
-		require.NoError(t, err)
+		cleanUpTempDir(t, tempDir, containerLogsDir)
 	})
 
 	ca, cert, key, err := generateCAAndCertKeyWithOptions(
@@ -3513,7 +3507,7 @@ func TestNewMainKubeletWithCertAndCAReloadingEnabled(t *testing.T) {
 	var prober volume.DynamicPluginProber
 	tp := noopoteltrace.NewTracerProvider()
 	cadvisor := cadvisortest.NewMockInterface(t)
-	cadvisor.EXPECT().MachineInfo().Return(&cadvisorapi.MachineInfo{}, nil).Maybe()
+	cadvisor.EXPECT().MachineInfo(logger).Return(&cadvisorapi.MachineInfo{}, nil).Maybe()
 	cadvisor.EXPECT().ImagesFsInfo(tCtx).Return(cadvisorapiv2.FsInfo{
 		Usage:     400,
 		Capacity:  1000,
@@ -3530,7 +3524,11 @@ func TestNewMainKubeletWithCertAndCAReloadingEnabled(t *testing.T) {
 		fakeRuntime.Stop()
 	}()
 	fakeRecorder := &record.FakeRecorder{}
-	rtSvc := createRemoteRuntimeService(tCtx, endpoint, t, noopoteltrace.NewTracerProvider())
+	rtSvc, err := remote.NewRemoteRuntimeServiceBuilder().
+		WithEndpoint(endpoint).
+		WithConnectionTimeout(15 * time.Second).
+		Build(tCtx)
+	require.NoError(t, err)
 	kubeDep := &Dependencies{
 		Auth:                 nil,
 		CAdvisorInterface:    cadvisor,
@@ -3632,12 +3630,21 @@ func TestSyncPodSpans(t *testing.T) {
 	defer func() {
 		fakeRuntime.Stop()
 	}()
-	runtimeSvc := createRemoteRuntimeService(tCtx, endpoint, t, tp)
+	runtimeSvc, err := remote.NewRemoteRuntimeServiceBuilder().
+		WithEndpoint(endpoint).
+		WithConnectionTimeout(15 * time.Second).
+		WithTracerProvider(tp).
+		Build(tCtx)
+	require.NoError(t, err)
 	kubelet.runtimeService = runtimeSvc
 
 	fakeRuntime.ImageService.SetFakeImageSize(100)
 	fakeRuntime.ImageService.SetFakeImages([]string{"test:latest"})
-	imageSvc, err := remote.NewRemoteImageService(tCtx, endpoint, 15*time.Second, tp, false)
+	imageSvc, err := remote.NewRemoteImageServiceBuilder().
+		WithEndpoint(endpoint).
+		WithConnectionTimeout(15 * time.Second).
+		WithTracerProvider(tp).
+		Build(tCtx)
 	assert.NoError(t, err)
 
 	kubelet.containerRuntime, _, err = kuberuntime.NewKubeGenericRuntimeManager(
@@ -4155,7 +4162,7 @@ func TestSyncPodWithErrorsDuringInPlacePodResize(t *testing.T) {
 }
 
 func TestHandlePodUpdates_RecordContainerRequestedResizes(t *testing.T) {
-	tCtx := ktesting.Init(t)
+	logger, tCtx := ktesting.NewTestContext(t)
 	metrics.Register()
 	metrics.ContainerRequestedResizes.Reset()
 
@@ -4736,7 +4743,7 @@ func TestHandlePodUpdates_RecordContainerRequestedResizes(t *testing.T) {
 			kubelet := testKubelet.kubelet
 
 			kubelet.podManager.AddPod(initialPod)
-			require.NoError(t, kubelet.allocationManager.SetAllocatedResources(initialPod))
+			require.NoError(t, kubelet.allocationManager.SetAllocatedResources(logger, initialPod))
 			kubelet.HandlePodUpdates(tCtx, []*v1.Pod{updatedPod})
 
 			tc.updateExpectedFunc(&expectedMetrics)
@@ -4800,7 +4807,7 @@ func TestHandlePodReconcile_RetryPendingResizes(t *testing.T) {
 		t.Skip("InPlacePodVerticalScaling is not currently supported for Windows")
 	}
 	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.InPlacePodVerticalScaling, true)
-	tCtx := ktesting.Init(t)
+	logger, tCtx := ktesting.NewTestContext(t)
 
 	testKubelet := newTestKubeletExcludeAdmitHandlers(t, false /* controllerAttachDetachEnabled */, true /*enableResizing*/)
 	defer testKubelet.Cleanup()
@@ -4922,21 +4929,21 @@ func TestHandlePodReconcile_RetryPendingResizes(t *testing.T) {
 			handler := &testPodAdmitHandler{podsToReject: []*v1.Pod{pendingResizeAllocated}}
 			kubelet.allocationManager.AddPodAdmitHandlers(lifecycle.PodAdmitHandlers{handler})
 
-			require.NoError(t, kubelet.allocationManager.SetAllocatedResources(pendingResizeAllocated))
-			require.NoError(t, kubelet.allocationManager.SetAllocatedResources(tc.oldPod))
+			require.NoError(t, kubelet.allocationManager.SetAllocatedResources(logger, pendingResizeAllocated))
+			require.NoError(t, kubelet.allocationManager.SetAllocatedResources(logger, tc.oldPod))
 
 			// We only expect status resources to change in HandlePodReconcile.
 			tc.oldPod.Spec = tc.newPod.Spec
 
 			kubelet.podManager.AddPod(pendingResizeDesired)
 			kubelet.podManager.AddPod(tc.oldPod)
-			kubelet.allocationManager.PushPendingResize(pendingResizeDesired.UID)
+			kubelet.allocationManager.PushPendingResize(logger, pendingResizeDesired.UID)
 
 			kubelet.statusManager.ClearPodResizePendingCondition(pendingResizeDesired.UID)
 			kubelet.HandlePodReconcile(tCtx, []*v1.Pod{tc.newPod})
 			require.Equal(t, tc.shouldRetryPendingResize, kubelet.statusManager.IsPodResizeDeferred(pendingResizeDesired.UID))
 
-			kubelet.allocationManager.RemovePod(pendingResizeDesired.UID)
+			kubelet.allocationManager.RemovePod(logger, pendingResizeDesired.UID)
 			kubelet.podManager.RemovePod((pendingResizeDesired))
 			kubelet.podManager.RemovePod(tc.oldPod)
 		})
@@ -5147,6 +5154,7 @@ func generateCAAndCertKeyWithOptions(host string, alternateIPs []net.IP, alterna
 }
 
 func TestSyncPodRestartAllContainersRequeue(t *testing.T) {
+	logger, tCtx := ktesting.NewTestContext(t)
 	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.NodeDeclaredFeatures, true)
 	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.RestartAllContainersOnContainerExits, true)
 
@@ -5168,7 +5176,6 @@ func TestSyncPodRestartAllContainersRequeue(t *testing.T) {
 	})
 	kubelet.podManager.SetPods([]*v1.Pod{pod})
 
-	logger := klog.FromContext(context.Background())
 	kubelet.statusManager.SetPodStatus(logger, pod, v1.PodStatus{
 		Phase: v1.PodRunning,
 		Conditions: []v1.PodCondition{
@@ -5210,11 +5217,27 @@ func TestSyncPodRestartAllContainersRequeue(t *testing.T) {
 		},
 	}
 
-	isTerminal, _, err := kubelet.SyncPod(context.Background(), kubetypes.SyncPodUpdate, pod, nil, podStatus)
+	isTerminal, _, err := kubelet.SyncPod(tCtx, kubetypes.SyncPodUpdate, pod, nil, podStatus)
 	require.False(t, isTerminal)
 	require.NoError(t, err)
 
 	// We expect SyncPod to be called once by us, and once recursively via UpdatePod -> fakePodWorkers.syncPodFn
 	// because the SyncResults contained a successful RemoveContainer action.
 	require.Equal(t, 1, callCount)
+}
+
+func cleanUpTempDir(t *testing.T, tempDir, originalLogsDir string) {
+	t.Helper()
+	ContainerLogsDir = originalLogsDir
+	// On Windows, we might need to retry RemoveAll because concurrent goroutines
+	// (like the garbage collector) might take a moment to exit and release file/dir handles.
+	var err error
+	for range 10 {
+		err = os.RemoveAll(tempDir)
+		if err == nil {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	require.NoError(t, err)
 }
