@@ -89,6 +89,10 @@ type Executor struct {
 	// when the victim was preempted only in scheduler memory, without a delete call.
 	// This is exposed to be replaced during tests.
 	PreemptPod func(ctx context.Context, c Candidate, preemptor ExecutorPreemptor, victim *v1.Pod, pluginName string) (bool, error)
+
+	// Tests use this hook to observe completion of one executor's deferred work
+	// without relying on process-wide metrics.
+	onAsyncPreemptionComplete func()
 }
 
 // NewExecutor creates a new preemption executor.
@@ -241,6 +245,9 @@ func (e *Executor) prepareCandidateAsync(c Candidate, preemptor ExecutorPreempto
 		logger := klog.FromContext(ctx)
 		startTime := time.Now()
 		result := metrics.GoroutineResultSuccess
+		if e.onAsyncPreemptionComplete != nil {
+			defer e.onAsyncPreemptionComplete()
+		}
 		defer metrics.PreemptionGoroutinesDuration.WithLabelValues(result).Observe(metrics.SinceInSeconds(startTime))
 		defer metrics.PreemptionGoroutinesExecutionTotal.WithLabelValues(result).Inc()
 		defer func() {

@@ -198,8 +198,10 @@ func TestIsPodRunningPreemption(t *testing.T) {
 }
 
 type fakePodActivator struct {
-	activatedPods map[string]*v1.Pod
-	mu            *sync.RWMutex
+	activatedPods            map[string]*v1.Pod
+	mu                       *sync.RWMutex
+	isPreempting             func() bool
+	activatedWhilePreempting bool
 }
 
 func (f *fakePodActivator) Activate(logger klog.Logger, pods map[string]*v1.Pod) {
@@ -207,6 +209,9 @@ func (f *fakePodActivator) Activate(logger klog.Logger, pods map[string]*v1.Pod)
 	defer f.mu.Unlock()
 	for name, pod := range pods {
 		f.activatedPods[name] = pod
+	}
+	if f.isPreempting != nil && f.isPreempting() {
+		f.activatedWhilePreempting = true
 	}
 }
 
@@ -1425,6 +1430,8 @@ func TestPreemptPod(t *testing.T) {
 
 func TestPrepareCandidateAsyncActivatesPreemptorAfterLastVictimInMemoryPreemption(t *testing.T) {
 	preemptorPod := st.MakePod().Name("p").UID("p").Priority(highPriority).Obj()
+	secondPreemptorPod := st.MakePod().Name("p2").UID("p2").Priority(highPriority).Obj()
+	preemptorPodGroup := &schedulingapi.PodGroup{ObjectMeta: metav1.ObjectMeta{Name: "pg", UID: "pg"}}
 	waitingVictim := st.MakePod().Name("waiting-v").UID("waiting-v").Priority(midPriority).Node("node1").Obj()
 	preBindVictim := st.MakePod().Name("prebind-v").UID("prebind-v").Priority(midPriority).Node("node1").Obj()
 	apiVictim := st.MakePod().Name("api-v").UID("api-v").Priority(midPriority).Node("node1").Obj()
@@ -1436,6 +1443,8 @@ func TestPrepareCandidateAsyncActivatesPreemptorAfterLastVictimInMemoryPreemptio
 		addVictimToPrebind          bool
 		addVictimToPrebindOnPreempt bool
 		addVictimToWaiting          bool
+		preemptorPodGroup           *schedulingapi.PodGroup
+		preemptorPods               []*v1.Pod
 		wantPreemptorActivate       bool
 	}{
 		{
@@ -1458,6 +1467,22 @@ func TestPrepareCandidateAsyncActivatesPreemptorAfterLastVictimInMemoryPreemptio
 			inMemoryVictim:              preBindVictim.DeepCopy(),
 			addVictimToPrebindOnPreempt: true,
 			wantPreemptorActivate:       true,
+		},
+		{
+			name:                  "last waiting pod after API-deleted victim",
+			victimPods:            []*v1.Pod{apiVictim.DeepCopy(), waitingVictim.DeepCopy()},
+			inMemoryVictim:        waitingVictim.DeepCopy(),
+			addVictimToWaiting:    true,
+			wantPreemptorActivate: true,
+		},
+		{
+			name:                  "last waiting pod for pod group",
+			victimPods:            []*v1.Pod{waitingVictim.DeepCopy()},
+			inMemoryVictim:        waitingVictim.DeepCopy(),
+			addVictimToWaiting:    true,
+			preemptorPodGroup:     preemptorPodGroup,
+			preemptorPods:         []*v1.Pod{preemptorPod.DeepCopy(), secondPreemptorPod.DeepCopy()},
+			wantPreemptorActivate: true,
 		},
 		{
 			name:               "non-last waiting pod",
@@ -1489,7 +1514,19 @@ func TestPrepareCandidateAsyncActivatesPreemptorAfterLastVictimInMemoryPreemptio
 				tf.RegisterBindPlugin(defaultbinder.Name, defaultbinder.New),
 				tf.RegisterPermitPlugin(waitingPermitPluginName, newWaitingPermitPlugin),
 			)
-			objects := []runtime.Object{preemptorPod}
+			preemptorPods := tt.preemptorPods
+			if len(preemptorPods) == 0 {
+				preemptorPods = []*v1.Pod{preemptorPod.DeepCopy()}
+			}
+			var preemptor ExecutorPreemptor = &podExecutorPreemptor{Pod: preemptorPods[0]}
+			if tt.preemptorPodGroup != nil {
+				preemptor = &podGroupExecutorPreemptor{pg: tt.preemptorPodGroup, pods: preemptorPods}
+			}
+
+			objects := make([]runtime.Object, 0, len(preemptorPods)+len(tt.victimPods))
+			for _, pod := range preemptorPods {
+				objects = append(objects, pod)
+			}
 			podsForSnapshot := make([]*v1.Pod, 0, len(tt.victimPods))
 			for _, pod := range tt.victimPods {
 				objects = append(objects, pod)
@@ -1531,6 +1568,15 @@ func TestPrepareCandidateAsyncActivatesPreemptorAfterLastVictimInMemoryPreemptio
 			}
 
 			executor := NewExecutor(fwk, feature.Features{EnableAsyncPreemption: true})
+			preemptionDone := make(chan struct{})
+			executor.onAsyncPreemptionComplete = func() {
+				close(preemptionDone)
+			}
+			fakeActivator.isPreempting = func() bool {
+				executor.mu.RLock()
+				defer executor.mu.RUnlock()
+				return executor.preempting.Has(preemptor.UID())
+			}
 			if tt.addVictimToPrebindOnPreempt {
 				preemptFunc := executor.PreemptPod
 				executor.PreemptPod = func(ctx context.Context, c Candidate, preemptor ExecutorPreemptor, victim *v1.Pod, pluginName string) (bool, error) {
@@ -1547,21 +1593,38 @@ func TestPrepareCandidateAsyncActivatesPreemptorAfterLastVictimInMemoryPreemptio
 					Pods: tt.victimPods,
 				},
 			}
-			executor.prepareCandidateAsync(candidate, &podExecutorPreemptor{Pod: preemptorPod}, "test-plugin")
+			executor.prepareCandidateAsync(candidate, preemptor, "test-plugin")
 
-			if err := wait.PollUntilContextTimeout(ctx, 10*time.Millisecond, wait.ForeverTestTimeout, false, func(ctx context.Context) (bool, error) {
-				executor.mu.RLock()
-				defer executor.mu.RUnlock()
-				return len(executor.preempting) == 0, nil
-			}); err != nil {
-				t.Fatalf("Timed out waiting for async preemption to finish: %v", err)
+			select {
+			case <-preemptionDone:
+			case <-time.After(wait.ForeverTestTimeout):
+				t.Fatal("Timed out waiting for async preemption to finish")
+			}
+
+			executor.mu.RLock()
+			preempting := executor.preempting.Has(preemptor.UID())
+			executor.mu.RUnlock()
+			if preempting {
+				t.Fatal("Preemptor is still marked as running preemption after the goroutine completed")
 			}
 
 			mu.RLock()
 			defer mu.RUnlock()
-			_, activated := fakeActivator.activatedPods[preemptorPod.Name]
-			if activated != tt.wantPreemptorActivate {
-				t.Fatalf("Preemptor activation = %v, want %v; activated pods: %v", activated, tt.wantPreemptorActivate, fakeActivator.activatedPods)
+			if fakeActivator.activatedWhilePreempting {
+				t.Fatal("Preemptor was activated before its preempting state was cleared")
+			}
+			wantActivatedPods := 0
+			if tt.wantPreemptorActivate {
+				wantActivatedPods = len(preemptor.Pods())
+			}
+			if len(fakeActivator.activatedPods) != wantActivatedPods {
+				t.Fatalf("Activated pod count = %d, want %d; activated pods: %v", len(fakeActivator.activatedPods), wantActivatedPods, fakeActivator.activatedPods)
+			}
+			for name := range preemptor.Pods() {
+				_, gotActivated := fakeActivator.activatedPods[name]
+				if gotActivated != tt.wantPreemptorActivate {
+					t.Fatalf("Preemptor pod %q activation = %v, want %v; activated pods: %v", name, gotActivated, tt.wantPreemptorActivate, fakeActivator.activatedPods)
+				}
 			}
 			if (tt.addVictimToPrebind || tt.addVictimToPrebindOnPreempt) && (victimCtx == nil || victimCtx.Err() == nil) {
 				t.Fatalf("Expected preBind victim context to be cancelled")
